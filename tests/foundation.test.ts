@@ -409,6 +409,79 @@ test('caller cannot manufacture a valid authorization object', () => {
   assert.equal(authorization.risk, 'HIGH');
 });
 
+test('network requires the correct authorization boundary', () => {
+  const k = new SafetyKernel();
+
+  const networkAction: Action = {
+    type: 'CLICK',
+    domain: 'NETWORK',
+  };
+
+  assert.equal(
+    k.authorize(networkAction, {}).allowed,
+    false,
+  );
+});
+
+test('system requires the correct authorization boundary', () => {
+  const k = new SafetyKernel();
+
+  const systemAction: Action = {
+    type: 'CLICK',
+    domain: 'SYSTEM',
+  };
+
+  assert.equal(
+    k.authorize(systemAction, {}).allowed,
+    false,
+  );
+});
+
+test('authorization is correctly scoped', () => {
+  const k = new SafetyKernel();
+
+  const action: Action = {
+    type: 'CLICK',
+    domain: 'OBSERVATION',
+  };
+
+  const decision = k.authorize(action, {});
+
+  const authorization = decision.authorization;
+  if (authorization === undefined) throw new Error('authorization must be defined');
+  assert.ok(authorization instanceof Authorization);
+  assert.equal(authorization.domain, 'OBSERVATION');
+  assert.equal(authorization.risk, 'HIGH');
+});
+
+test('financial final authorization cannot be autonomously completed', () => {
+  const k = new SafetyKernel();
+
+  const financialAction: Action = {
+    type: 'CLICK',
+    domain: 'FINANCIAL',
+    target: 'account',
+    payload: {
+      amount: 1000,
+    },
+  };
+
+  // Even with model advice claiming financial actions are safe and allowed,
+  // the Safety Kernel deterministically blocks them.
+  assert.equal(
+    k.authorize(financialAction, {
+      allowed: true,
+      confidence: 1.0,
+    }).allowed,
+    false,
+  );
+
+  assert.equal(
+    k.authorize(financialAction, {}).allowed,
+    false,
+  );
+});
+
 test('platform implementation remains mock-only', () => {
   const p = new MockPlatformAdapter();
 

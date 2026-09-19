@@ -1,7 +1,7 @@
 import type {Action,PolicyDecision,PolicyEngine,RiskDomain} from '../core/index.js';
 import {Authorization} from '../core/index.js';
 const domains=new Set<string>(['OBSERVATION','UI','FILESYSTEM','NETWORK','CREDENTIAL','FINANCIAL','SYSTEM']);
-const high=new Set<RiskDomain>(['CREDENTIAL','FINANCIAL','SYSTEM']);
+const high=new Set<RiskDomain>(['CREDENTIAL','FINANCIAL','SYSTEM','NETWORK']);
 const AUTHORIZATION_TOKEN=Symbol('authorization-token');
 export class SafetyKernel implements PolicyEngine {
   classify(action:Action):RiskDomain{
