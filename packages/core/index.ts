@@ -25,3 +25,8 @@ export class Authorization {
 export interface PolicyDecision { readonly allowed:boolean; readonly risk:RiskDomain; readonly reason:string; readonly authorization?:Authorization; }
 export interface PolicyEngine { classify(action:Action):RiskDomain; authorize(action:Action,modelAdvice?:Readonly<Record<string,unknown>>):PolicyDecision; }
 export const freeze = <T>(value:T):Readonly<T> => { const seen = new WeakSet<object>(); const visit=(v:any):any=>{if(v && typeof v==='object' && !seen.has(v)){seen.add(v); for(const key of Reflect.ownKeys(v)) visit(v[key]); Object.freeze(v);} return v;}; return visit(value); };
+export type SemanticRole = 'BUTTON'|'TEXT_INPUT'|'CHECKBOX'|'RADIO'|'SELECT'|'LINK'|'MENU'|'MENU_ITEM'|'DIALOG'|'WINDOW'|'TAB'|'TOOLBAR'|'SLIDER'|'SPINNER'|'LABEL'|'HEADING'|'LIST'|'LIST_ITEM'|'TABLE'|'CELL'|'TOOLTIP'|'ALERT'|'NOTIFICATION'|'unknown';
+export type InteractionState = 'enabled'|'disabled'|'focused'|'selected'|'pressed'|'checked'|'expanded'|'collapsed'|'busy'|'readonly';
+export type UIElement = Readonly<{id: string; role: SemanticRole; label: string; text?: string; bounds?: Readonly<{x: number; y: number; width: number; height: number}>; states: readonly InteractionState[]; parentId?: string; childIds: readonly string[]; metadata: Readonly<Record<string, unknown>>}>;
+export type UIStateGraph = Readonly<{readonly windowId: string; readonly title: string; readonly application?: string; readonly elements: ReadonlyArray<UIElement>; readonly rootElementId?: string; readonly timestamp: number; readonly stateSignature: string}>;
+export type PerceptionProvider = {readonly providerKind: string; observe(): Promise<UIStateGraph>};
