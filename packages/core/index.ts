@@ -1,7 +1,14 @@
 export type TaskState = 'CREATED'|'PLANNING'|'READY'|'RUNNING'|'VERIFYING'|'WAITING'|'NEEDS_USER'|'COMPLETED'|'FAILED';
 export type RiskDomain = 'OBSERVATION'|'UI'|'FILESYSTEM'|'NETWORK'|'CREDENTIAL'|'FINANCIAL'|'SYSTEM';
 export type ActionType = 'CLICK'|'TYPE'|'KEY_PRESS'|'SCROLL'|'OPEN'|'SELECT'|'WAIT'|'OBSERVE';
-export type Action = Readonly<{type: ActionType; domain: string; target?: string; payload?: Readonly<Record<string, unknown>>}>;
+export type Action = Readonly<{
+  type: ActionType;
+  domain: string;
+  target?: string;
+  payload?: Readonly<Record<string, unknown>>;
+  stateSignature?: string;
+  retryable?: boolean;
+}>;
 export type ActionResult = Readonly<{ok: boolean; message?: string; data?: Readonly<Record<string, unknown>>}>;
 export type TaskStep = Readonly<{id: string; description: string; action?: Action; verified: boolean}>;
 export type Task = Readonly<{id: string; goal: string; state: TaskState; steps: readonly TaskStep[]; attempts: number; maxAttempts: number; version: number}>;
