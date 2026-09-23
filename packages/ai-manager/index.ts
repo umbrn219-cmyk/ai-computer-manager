@@ -332,53 +332,57 @@ export class AIManager {
       context,
     };
 
-    // Stage 2 - planning, bounded by maxPlanningAttempts. Provider failures
-    // surface immediately; only structurally invalid planner output may
-    // consume another attempt, never more than the configured maximum.
+    // Stage 2 - planning. Two distinct failure classes:
+    //   - deterministic validation failures (malformed / empty / oversized /
+    //     invalid structure) surface their leaf reason immediately and are
+    //     never retried: a structurally invalid response is not a transient
+    //     condition, and the SafetyKernel - not this module - owns policy.
+    //   - genuine provider failures stay retryable, bounded by
+    //     maxPlanningAttempts. The attempt budget is never unbounded.
     const plannerInput = {
       goal: intent.goal,
       objective: intent.objective,
       constraints: intent.constraints,
       context: intent.context,
     };
-    let lastValidationFailure: ValidationFailure | undefined;
     for (let attempt = 1; attempt <= this.limits.maxPlanningAttempts; attempt += 1) {
       let plannerResponse: unknown;
       try {
         plannerResponse = await this.router.request(MODEL_ROLE_CAPABILITY.Planner, plannerInput);
       } catch (error) {
         const modelFailure = this.classifyModelError(error);
-        return this.failure(modelFailure.reason, modelFailure.message, attempt);
+        const attemptsLeft = attempt < this.limits.maxPlanningAttempts;
+        if (!modelFailure.retryable || !attemptsLeft) {
+          return this.failure(modelFailure.reason, modelFailure.message, attempt);
+        }
+        continue;
       }
       const parsedPlan = parsePlanResponse(plannerResponse, this.limits);
       if (parsedPlan.ok) {
         const plan: TaskPlan = { goal: intent.goal, steps: parsedPlan.value };
         return { ok: true, intent, plan, attempts: attempt };
       }
-      lastValidationFailure = parsedPlan;
+      // Deterministic validation failure - surface the leaf reason directly.
+      return this.failure(parsedPlan.reason, parsedPlan.message, attempt);
     }
 
-    const detail = lastValidationFailure?.message;
-    return detail === undefined
-      ? this.failure('attempts_exhausted', 'Planning attempts exhausted before any planner call', 0)
-      : this.failure(
-          'attempts_exhausted',
-          'Planning attempts exhausted',
-          this.limits.maxPlanningAttempts,
-          detail,
-        );
+    return this.failure('attempts_exhausted', 'Planning attempts exhausted', this.limits.maxPlanningAttempts);
   }
 
-  private classifyModelError(error: unknown): { reason: PlanningFailureReason; message: string } {
+  private classifyModelError(
+    error: unknown,
+  ): { reason: PlanningFailureReason; message: string; retryable: boolean } {
     if (error instanceof UnsupportedCapabilityError) {
-      return { reason: 'unsupported_capability', message: error.message };
+      // No provider advertises the capability: retrying cannot help.
+      return { reason: 'unsupported_capability', message: error.message, retryable: false };
     }
     if (error instanceof ModelProviderError) {
-      return { reason: 'provider_failure', message: error.message };
+      return { reason: 'provider_failure', message: error.message, retryable: true };
     }
     return {
       reason: 'provider_failure',
       message: error instanceof Error ? error.message : String(error),
+      retryable: true,
     };
   }
 
