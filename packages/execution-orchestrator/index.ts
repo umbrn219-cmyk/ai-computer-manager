@@ -33,13 +33,17 @@
  *     -> advance / bounded step recovery / NEEDS_USER / FAILED
  */
 
-import { freeze } from '../core/index.js';
+import { CHECKPOINT_SCHEMA_VERSION, CheckpointRejectedError, freeze } from '../core/index.js';
 import type {
   Action,
   ActionType,
+  CheckpointStatus,
+  CheckpointStore,
+  ExecutionCheckpoint,
   PerceptionProvider,
   Task,
   TaskEngine,
+  TaskState,
   UIStateGraph,
 } from '../core/index.js';
 import type { ActionOutcome } from '../action-engine/index.js';
@@ -135,6 +139,7 @@ export const DEFAULT_ORCHESTRATOR_LIMITS: OrchestratorLimits = Object.freeze({
 export type OrchestrationReason =
   | 'plan_invalid'
   | 'resume_unavailable'
+  | 'recovery_required'
   | 'orchestration_error'
   | 'observation_failure'
   | 'missing_target'
@@ -147,6 +152,25 @@ export type OrchestrationReason =
   | 'action_failed'
   | 'verification_failed'
   | 'informational_step';
+
+/** Runtime vocabulary of the reason union, used to validate recovered reasons. */
+const ORCHESTRATION_REASONS: readonly OrchestrationReason[] = [
+  'plan_invalid',
+  'resume_unavailable',
+  'recovery_required',
+  'orchestration_error',
+  'observation_failure',
+  'missing_target',
+  'ambiguous_target',
+  'stale_state',
+  'user_interference',
+  'safety_denied',
+  'authorization_required',
+  'preflight_rejected',
+  'action_failed',
+  'verification_failed',
+  'informational_step',
+];
 
 export type ActionRejectionClass = Readonly<{
   reason: OrchestrationReason;
@@ -213,7 +237,7 @@ export type StepOutcome = Readonly<{
 }>;
 
 export type OrchestrationOutcome = Readonly<{
-  status: 'completed' | 'needs_user' | 'failed';
+  status: 'completed' | 'needs_user' | 'failed' | 'recovery_required';
   reason: OrchestrationReason | 'completed';
   message: string;
   /** True when a per-step attempt budget was consumed by bounded retries. */
@@ -236,11 +260,24 @@ export type OrchestrationRequest = Readonly<{
 type RunCursor = {
   taskId: string;
   plan: TaskPlan;
+  /** Deterministic plan fingerprint - the checkpoint `planVersion`. */
+  planVersion: string;
   stepIndex: number;
   readonly stepAttempts: Map<number, number>;
   /** Steps whose actuation happened but could not yet be verified. */
   readonly needsReconcile: Set<number>;
+  /**
+   * Steps recovered from a durable checkpoint where an actuation may have
+   * happened without a confirmable result. These must never be blindly
+   * replayed: if reconciliation cannot confirm the effect, the run stops.
+   */
+  readonly ambiguityPending: Set<number>;
+  readonly verifiedStepIds: string[];
   readonly steps: StepOutcome[];
+  /** Reason recorded when the run paused for user interaction. */
+  pauseReason?: OrchestrationReason;
+  /** Reason recorded when the run stopped terminally. */
+  terminalReason?: OrchestrationReason;
 };
 
 export type OrchestratorDependencies = Readonly<{
@@ -249,7 +286,36 @@ export type OrchestratorDependencies = Readonly<{
   actionExecutor: ActionExecutor;
   verifier?: StepVerifier;
   limits?: OrchestratorLimits;
+  /**
+   * Optional durable checkpoint store (behind StorageEngine). When absent, the
+   * cursor stays in memory exactly as in Phase 7.
+   */
+  checkpoints?: CheckpointStore;
+  /**
+   * How the caller supplies the plan when a durable resume happens in a NEW
+   * process. Checkpoints deliberately store plan identity (`planVersion`
+   * fingerprint) only, never plan contents, so the plan must come from the
+   * caller's own store. Same-process resumes use the in-memory plan registry.
+   */
+  resolvePlan?: (taskId: string) => TaskPlan | undefined;
 }>;
+
+/**
+ * Deterministic content fingerprint of a plan, used as the checkpoint
+ * `planVersion`. A checkpoint can therefore never be resumed against a
+ * different plan, and it contains no model prose or secrets.
+ */
+export const planFingerprint = (plan: TaskPlan): string => {
+  const steps = plan.steps.map((step) => {
+    const action = step.action;
+    const actionPart =
+      action === undefined
+        ? 'none'
+        : [action.type, action.domain, action.target ?? '', String(action.retryable ?? '')].join('~');
+    return [step.id, step.description, actionPart].join('|');
+  });
+  return `p1:${steps.length}:${steps.join('||')}`;
+};
 
 /**
  * Deterministic execution orchestrator. It owns only the run cursor (which
@@ -263,7 +329,11 @@ export class ExecutionOrchestrator {
   private readonly actionExecutor: ActionExecutor;
   private readonly verifier: StepVerifier;
   private readonly limits: OrchestratorLimits;
+  private readonly checkpoints: CheckpointStore | undefined;
+  private readonly resolvePlan: ((taskId: string) => TaskPlan | undefined) | undefined;
   private readonly cursors = new Map<string, RunCursor>();
+  /** Plans seen in this process, so an in-process durable resume needs no lookup. */
+  private readonly plans = new Map<string, TaskPlan>();
 
   constructor(dependencies: OrchestratorDependencies) {
     const limits = dependencies.limits ?? DEFAULT_ORCHESTRATOR_LIMITS;
@@ -280,6 +350,8 @@ export class ExecutionOrchestrator {
     this.actionExecutor = dependencies.actionExecutor;
     this.verifier = dependencies.verifier ?? new ObservationBasedStepVerifier();
     this.limits = limits;
+    this.checkpoints = dependencies.checkpoints;
+    this.resolvePlan = dependencies.resolvePlan;
   }
 
   /** Run a validated plan to a terminal or paused outcome. Never unbounded. */
@@ -308,16 +380,22 @@ export class ExecutionOrchestrator {
       const cursor: RunCursor = {
         taskId: task.id,
         plan: request.plan,
+        planVersion: planFingerprint(request.plan),
         stepIndex: 0,
         stepAttempts: new Map(),
         needsReconcile: new Set(),
+        ambiguityPending: new Set(),
+        verifiedStepIds: [],
         steps: [],
       };
       this.cursors.set(task.id, cursor);
+      this.plans.set(task.id, request.plan);
       // The plan arrived already validated by the AI Manager, so the lifecycle
       // goes straight from PLANNING to READY.
       this.taskEngine.transition(task.id, 'PLANNING');
       this.taskEngine.transition(task.id, 'READY');
+      // Durable boundary 1: the task has entered an executable state.
+      this.writeCheckpoint(cursor, { status: 'RUNNING', reconcilePending: false });
       return await this.advance(cursor);
     } catch (error) {
       return this.outcome(
@@ -334,23 +412,15 @@ export class ExecutionOrchestrator {
   }
 
   /**
-   * Resume a paused run from its checkpoint (the stored step cursor). Nothing is
-   * replayed from the start and no already-completed step is re-executed.
+   * Resume a run from its durable checkpoint. The signature is unchanged from
+   * Phase 7: the plan is recovered from this process's registry, or from the
+   * caller's own store through the optional `resolvePlan` dependency.
+   *
+   * A run paused in NEEDS_USER is NOT resumed by this call - the user boundary
+   * is reported back instead, so a restart can never cross it automatically.
    */
   async resume(taskId: string): Promise<OrchestrationOutcome> {
-    const cursor = this.cursors.get(taskId);
-    if (cursor === undefined) {
-      return this.outcome(
-        'failed',
-        'resume_unavailable',
-        `No resumable run checkpoint for task ${taskId}`,
-        false,
-        false,
-        taskId,
-        this.taskEngine.getTask(taskId) ?? null,
-        [],
-      );
-    }
+    const inMemory = this.cursors.get(taskId);
     try {
       const task = this.taskEngine.getTask(taskId);
       if (task === undefined) {
@@ -362,13 +432,20 @@ export class ExecutionOrchestrator {
           false,
           taskId,
           null,
-          cursor.steps,
+          inMemory?.steps ?? [],
         );
       }
-      if (task.state === 'NEEDS_USER') {
-        this.taskEngine.transition(taskId, 'READY');
+
+      // Terminal tasks: nothing to resume. A leftover checkpoint is cleaned up.
+      if (task.state === 'COMPLETED' || task.state === 'FAILED') {
+        return this.terminalOutcome(taskId, task, inMemory);
       }
-      return await this.advance(cursor);
+
+      const plan = this.plans.get(taskId) ?? this.resolvePlan?.(taskId);
+      if (inMemory !== undefined) {
+        return await this.continueTask(inMemory, plan);
+      }
+      return await this.durableResume(task, plan);
     } catch (error) {
       return this.outcome(
         'failed',
@@ -378,8 +455,281 @@ export class ExecutionOrchestrator {
         false,
         taskId,
         this.taskEngine.getTask(taskId) ?? null,
+        inMemory?.steps ?? [],
+      );
+    }
+  }
+
+  /** In-process continuation of a run that already has a cursor. */
+  private async continueTask(
+    cursor: RunCursor,
+    plan: TaskPlan | undefined,
+  ): Promise<OrchestrationOutcome> {
+    if (plan !== undefined && planFingerprint(plan) !== cursor.planVersion) {
+      return this.recovery(
+        cursor,
+        'Resume refused: the supplied plan does not match the active run (plan identity mismatch)',
+      );
+    }
+    const task = this.taskEngine.getTask(cursor.taskId);
+    if (task === undefined) {
+      return this.outcome(
+        'failed',
+        'resume_unavailable',
+        `Task not found: ${cursor.taskId}`,
+        false,
+        false,
+        cursor.taskId,
+        null,
         cursor.steps,
       );
+    }
+    if (task.state === 'NEEDS_USER') {
+      // The user boundary survives the resume call: it must be crossed by an
+      // explicit user action outside this API, never automatically.
+      return this.outcome(
+        'needs_user',
+        cursor.pauseReason ?? 'authorization_required',
+        'Run is paused for user interaction; resume reports the pause and never crosses it automatically',
+        false,
+        false,
+        task.id,
+        task,
+        cursor.steps,
+      );
+    }
+    this.writeCheckpoint(cursor, {
+      status: 'RUNNING',
+      reconcilePending: cursor.needsReconcile.size > 0,
+    });
+    return await this.advance(cursor);
+  }
+
+  /** Rebuild the cursor from a durable checkpoint (fresh process). */
+  private async durableResume(
+    task: Task,
+    plan: TaskPlan | undefined,
+  ): Promise<OrchestrationOutcome> {
+    if (this.checkpoints === undefined) {
+      return this.outcome(
+        'failed',
+        'resume_unavailable',
+        'No in-memory cursor and no checkpoint store configured',
+        false,
+        false,
+        task.id,
+        task,
+        [],
+      );
+    }
+    let checkpoint: ExecutionCheckpoint | undefined;
+    try {
+      checkpoint = this.checkpoints.loadCheckpoint(task.id);
+    } catch (error) {
+      return this.outcome(
+        'recovery_required',
+        'recovery_required',
+        `Checkpoint rejected: ${error instanceof Error ? error.message : String(error)}`,
+        false,
+        false,
+        task.id,
+        task,
+        [],
+      );
+    }
+    if (checkpoint === undefined) {
+      return this.outcome(
+        'failed',
+        'resume_unavailable',
+        `No durable checkpoint for task ${task.id}`,
+        false,
+        false,
+        task.id,
+        task,
+        [],
+      );
+    }
+    if (checkpoint.taskVersion > task.version) {
+      // A checkpoint from the future can only be corrupt or foreign.
+      return this.outcome(
+        'recovery_required',
+        'recovery_required',
+        `Checkpoint taskVersion ${checkpoint.taskVersion} is ahead of task version ${task.version}: refusing a foreign checkpoint`,
+        false,
+        false,
+        task.id,
+        task,
+        [],
+      );
+    }
+    if (task.state === 'NEEDS_USER') {
+      return this.outcome(
+        'needs_user',
+        this.reasonFrom(checkpoint.reason) ?? 'authorization_required',
+        'Restored pause: this task still requires an explicit user action after restart',
+        false,
+        false,
+        task.id,
+        task,
+        [],
+      );
+    }
+    if (plan === undefined) {
+      return this.outcome(
+        'failed',
+        'resume_unavailable',
+        'A durable resume needs the plan, and none is available for this task',
+        false,
+        false,
+        task.id,
+        task,
+        [],
+      );
+    }
+    if (planFingerprint(plan) !== checkpoint.planVersion) {
+      return this.outcome(
+        'recovery_required',
+        'recovery_required',
+        'Checkpoint plan identity does not match the supplied plan: the old checkpoint cannot be consumed',
+        false,
+        false,
+        task.id,
+        task,
+        [],
+      );
+    }
+    const cursor: RunCursor = {
+      taskId: task.id,
+      plan,
+      planVersion: checkpoint.planVersion,
+      stepIndex: checkpoint.activeStepIndex,
+      stepAttempts: new Map(checkpoint.stepAttempts.map((entry) => [entry.index, entry.attempts])),
+      needsReconcile: new Set(checkpoint.reconcilePending ? [checkpoint.activeStepIndex] : []),
+      ambiguityPending: new Set(checkpoint.reconcilePending ? [checkpoint.activeStepIndex] : []),
+      verifiedStepIds: [...checkpoint.verifiedStepIds],
+      steps: this.rebuildStepRecords(checkpoint, plan),
+    };
+    this.cursors.set(task.id, cursor);
+    this.plans.set(task.id, plan);
+    this.writeCheckpoint(cursor, {
+      status: 'RUNNING',
+      reconcilePending: checkpoint.reconcilePending,
+    });
+    return await this.advance(cursor);
+  }
+
+  /**
+   * Minimal reporting records for steps a checkpoint says are already verified.
+   * Only verification recorded in the checkpoint produces these; a model can
+   * never establish them.
+   */
+  private rebuildStepRecords(checkpoint: ExecutionCheckpoint, plan: TaskPlan): StepOutcome[] {
+    const records: StepOutcome[] = [];
+    for (const id of checkpoint.verifiedStepIds) {
+      const index = plan.steps.findIndex((entry) => entry.id === id);
+      if (index >= 0) {
+        records.push({
+          stepId: id,
+          index,
+          kind: 'action',
+          verified: true,
+          completed: true,
+          attempts: 0,
+        });
+      }
+    }
+    return records;
+  }
+
+  /** Terminal task: nothing to resume; remove any leftover checkpoint. */
+  private terminalOutcome(
+    taskId: string,
+    task: Task,
+    cursor: RunCursor | undefined,
+  ): OrchestrationOutcome {
+    this.deleteCheckpoint(taskId);
+    const completed = task.state === 'COMPLETED';
+    const reason: OrchestrationOutcome['reason'] = completed
+      ? 'completed'
+      : this.reasonFrom(cursor?.terminalReason) ?? 'orchestration_error';
+    return this.outcome(
+      completed ? 'completed' : 'failed',
+      reason,
+      completed
+        ? 'Task is already complete; checkpoint removed'
+        : `Task is already terminal (${task.state}); checkpoint removed`,
+      false,
+      completed,
+      task.id,
+      task,
+      cursor?.steps ?? [],
+    );
+  }
+
+  private recovery(cursor: RunCursor, message: string): OrchestrationOutcome {
+    return this.outcome(
+      'recovery_required',
+      'recovery_required',
+      message,
+      false,
+      false,
+      cursor.taskId,
+      this.taskEngine.getTask(cursor.taskId) ?? null,
+      cursor.steps,
+    );
+  }
+
+  private reasonFrom(value: string | undefined): OrchestrationReason | undefined {
+    if (value === undefined) return undefined;
+    return ORCHESTRATION_REASONS.includes(value as OrchestrationReason)
+      ? (value as OrchestrationReason)
+      : undefined;
+  }
+
+  private deleteCheckpoint(taskId: string): void {
+    if (this.checkpoints === undefined) return;
+    this.checkpoints.deleteCheckpoint(taskId);
+  }
+
+  /**
+   * Persist the complete immutable checkpoint as one logical operation. The
+   * snapshot is always built in full, so a partial write is impossible. A write
+   * the store rejects as stale is not an error for the run: the newer stored
+   * state wins, exactly as required.
+   */
+  private writeCheckpoint(
+    cursor: RunCursor,
+    state: Readonly<{
+      status: CheckpointStatus;
+      reconcilePending: boolean;
+      reason?: string;
+      activeStepIndex?: number;
+      verifiedStepIds?: readonly string[];
+    }>,
+  ): void {
+    if (this.checkpoints === undefined) return;
+    const task = this.taskEngine.getTask(cursor.taskId);
+    if (task === undefined) return;
+    const activeStepIndex = state.activeStepIndex ?? cursor.stepIndex;
+    const checkpoint: ExecutionCheckpoint = {
+      taskId: task.id,
+      taskVersion: task.version,
+      planVersion: cursor.planVersion,
+      activeStepIndex,
+      stepAttempts: [...cursor.stepAttempts.entries()]
+        .filter(([index]) => index <= activeStepIndex)
+        .map(([index, attempts]) => ({ index, attempts })),
+      verifiedStepIds: [...(state.verifiedStepIds ?? cursor.verifiedStepIds)],
+      status: state.status,
+      reconcilePending: state.reconcilePending,
+      checkpointVersion: CHECKPOINT_SCHEMA_VERSION,
+      ...(state.reason !== undefined ? { reason: state.reason } : {}),
+    };
+    try {
+      this.checkpoints.saveCheckpoint(checkpoint);
+    } catch (error) {
+      if (error instanceof CheckpointRejectedError) return;
+      throw error;
     }
   }
 
@@ -456,6 +806,14 @@ export class ExecutionOrchestrator {
       this.taskEngine.transition(cursor.taskId, 'VERIFYING');
     }
     const task = this.taskEngine.transition(cursor.taskId, 'COMPLETED');
+    // Durable boundary: completion is recorded atomically, then the checkpoint is
+    // removed - completed runs never retain one.
+    this.writeCheckpoint(cursor, {
+      status: 'COMPLETED',
+      reconcilePending: false,
+      activeStepIndex: cursor.steps.length,
+    });
+    this.deleteCheckpoint(cursor.taskId);
     const allVerified = cursor.steps.every((step) => step.kind === 'informational' || step.verified);
     return this.outcome(
       'completed',
@@ -488,7 +846,7 @@ export class ExecutionOrchestrator {
     index: number,
     stepId: string,
     attempts: number,
-    status: 'failed' | 'needs_user',
+    status: 'failed' | 'needs_user' | 'recovery_required',
     reason: OrchestrationReason,
     message: string,
     actionType?: ActionType,
@@ -507,7 +865,31 @@ export class ExecutionOrchestrator {
         ...(actionType !== undefined ? { actionType } : {}),
       }),
     );
-    const task = this.taskEngine.transition(cursor.taskId, status === 'needs_user' ? 'NEEDS_USER' : 'FAILED');
+    if (status === 'failed') {
+      cursor.terminalReason = reason;
+    } else {
+      cursor.pauseReason = reason;
+    }
+    const target: TaskState = status === 'failed' ? 'FAILED' : 'NEEDS_USER';
+    const current = this.taskEngine.getTask(cursor.taskId);
+    const task =
+      current !== undefined && current.state === target
+        ? current
+        : this.taskEngine.transition(cursor.taskId, target);
+    if (status === 'failed') {
+      // Terminal: the checkpoint has no further purpose (data lifecycle - no
+      // retention for terminal tasks).
+      this.deleteCheckpoint(cursor.taskId);
+    } else {
+      // Durable boundary: a pause the user must resolve. Written against the new
+      // task version so a restart can restore the boundary exactly.
+      this.writeCheckpoint(cursor, {
+        status: 'NEEDS_USER',
+        reconcilePending: cursor.needsReconcile.has(index),
+        reason,
+        activeStepIndex: index,
+      });
+    }
     return this.outcome(status, reason, message, exhausted, false, task.id, task, cursor.steps);
   }
 
@@ -531,6 +913,14 @@ export class ExecutionOrchestrator {
       this.enterRunning(cursor.taskId);
       attempts += 1;
       cursor.stepAttempts.set(index, attempts);
+      // Durable boundary: the attempt has begun. `reconcilePending` carries the
+      // "an actuation may already have happened for this step" marker forward, so
+      // a crash here can never masquerade as a clean pre-action state.
+      this.writeCheckpoint(cursor, {
+        status: 'RUNNING',
+        reconcilePending: cursor.needsReconcile.has(index),
+        activeStepIndex: index,
+      });
 
       // 1. Observation before any action is even considered.
       let before: UIStateGraph;
@@ -569,7 +959,31 @@ export class ExecutionOrchestrator {
               message: `Reconciled without repeating the action: ${reconciliation.reason}`,
             }),
           );
+          if (!cursor.verifiedStepIds.includes(stepId)) cursor.verifiedStepIds.push(stepId);
+          // Durable boundary: the step is verified and the cursor advances.
+          this.writeCheckpoint(cursor, {
+            status: 'RUNNING',
+            reconcilePending: false,
+            activeStepIndex: index + 1,
+          });
           return null;
+        }
+        if (cursor.ambiguityPending.has(index)) {
+          // Recovered from a restart: an actuation may or may not have happened
+          // and the verifier cannot confirm it. Replaying is not safe, so the run
+          // stops for a human decision instead of guessing.
+          cursor.ambiguityPending.delete(index);
+          return this.halt(
+            cursor,
+            index,
+            stepId,
+            attempts,
+            'recovery_required',
+            'recovery_required',
+            'Unconfirmed actuation after restart: the previous attempt may have taken effect and cannot be verified, so the action is not replayed',
+            action.type,
+            true,
+          );
         }
       }
 
@@ -578,6 +992,16 @@ export class ExecutionOrchestrator {
       //    actions so the ActionEngine's stale/interference checks stay live.
       const submitted: Action =
         action.target !== undefined ? { ...action, stateSignature: before.stateSignature } : action;
+
+      // Durable boundary: about to hand the action to the execution boundary, so
+      // the checkpoint now records that an actuation may occur. This is exactly
+      // what lets a crash between action and checkpoint be recovered without a
+      // blind replay.
+      this.writeCheckpoint(cursor, {
+        status: 'RUNNING',
+        reconcilePending: true,
+        activeStepIndex: index,
+      });
 
       // 4. Execution boundary: ActionEngine owns grounding, policy, pre-flight,
       //    actuation and postcondition checks.
@@ -629,6 +1053,14 @@ export class ExecutionOrchestrator {
               message: decision.reason,
             }),
           );
+          if (!cursor.verifiedStepIds.includes(stepId)) cursor.verifiedStepIds.push(stepId);
+          // Durable boundary: the step is verified and the cursor advances. The
+          // pending-actuation marker is cleared because this step is settled.
+          this.writeCheckpoint(cursor, {
+            status: 'RUNNING',
+            reconcilePending: false,
+            activeStepIndex: index + 1,
+          });
           return null;
         }
         // Not verified: the step is NOT complete, and the actuation may already
